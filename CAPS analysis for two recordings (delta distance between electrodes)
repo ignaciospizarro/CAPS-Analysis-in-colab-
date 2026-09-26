@@ -1,0 +1,210 @@
+!pip install neo
+import os
+import neo
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.signal import welch
+from google.colab import drive
+from scipy.integrate import simpson
+from scipy.interpolate import CubicSpline
+
+
+from google.colab import drive
+
+if not os.path.exists('/content/drive'):
+    drive.mount('/content/drive')
+if not os.path.exists('/content/drive'):
+    drive.mount('/content/drive')
+
+# ==========================================================
+# CAP ANALYSIS PIPELINE (Two-Point Delta with Raw Sweeps Overlay)
+# ==========================================================
+import os
+import neo
+import numpy as np
+import plotly.graph_objects as go
+from scipy.interpolate import CubicSpline
+from google.colab import drive
+
+if not os.path.exists('/content/drive'):
+    drive.mount('/content/drive')
+
+# CONFIGURATION (Two Recording Distances)
+file_proximal = '00059.abf'  # Closer electrode recording file
+file_distal = '00062.abf'    # Further electrode recording file
+
+path_proximal = f'/content/drive/MyDrive/Caps_Analysis/{file_proximal}'
+path_distal = f'/content/drive/MyDrive/Caps_Analysis/{file_distal}'
+
+distance_proximal_mm = 8.0   # Proximal electrode distance from stimulus (mm)
+distance_distal_mm = 14.0    # Distal electrode distance from stimulus (mm)
+delta_distance_mm = distance_distal_mm - distance_proximal_mm
+
+for p in [path_proximal, path_distal]:
+    if not os.path.exists(p):
+        raise FileNotFoundError(f"Could not find file at: {p}")
+
+def process_abf_file_with_sweeps(file_path):
+    print(f"-> Loading and processing: {os.path.basename(file_path)}")
+    reader = neo.io.AxonIO(filename=file_path)
+    block = reader.read_block(lazy=False)
+
+    pre_stim_ms = 5.0
+    post_stim_ms = 45.0
+    aligned_epochs = []
+    sampling_rate = None
+
+    for seg in block.segments:
+        if len(seg.analogsignals) > 0:
+            sig = seg.analogsignals[0]
+            sampling_rate = float(sig.sampling_rate.rescale('Hz').magnitude)
+            data = np.ravel(sig[:, 0].magnitude)
+
+            pre_pts = int((pre_stim_ms / 1000.0) * sampling_rate)
+            post_pts = int((post_stim_ms / 1000.0) * sampling_rate)
+
+            search_window_pts = int((20.0 / 1000.0) * sampling_rate)
+            if len(data) >= search_window_pts:
+                local_stim_idx = np.argmax(np.abs(data[:search_window_pts]))
+                epoch_start = local_stim_idx - pre_pts
+                epoch_end = local_stim_idx + post_pts
+
+                if epoch_start >= 0 and epoch_end <= len(data):
+                    aligned_epochs.append(data[epoch_start:epoch_end])
+
+    if len(aligned_epochs) == 0:
+        sig = block.segments[0].analogsignals[0]
+        voltage_stream = np.ravel(sig[:, 0].magnitude)
+        sampling_rate = float(sig.sampling_rate.rescale('Hz').magnitude)
+        sweep_duration_ms = 1000.0
+        points_per_sweep = int((sweep_duration_ms / 1000.0) * sampling_rate)
+        total_sweeps = len(voltage_stream) // points_per_sweep
+        pre_pts = int((pre_stim_ms / 1000.0) * sampling_rate)
+        post_pts = int((post_stim_ms / 1000.0) * sampling_rate)
+
+        for i in range(total_sweeps):
+            start_idx = i * points_per_sweep
+            end_idx = start_idx + points_per_sweep
+            chunk = voltage_stream[start_idx:end_idx]
+            local_stim_idx = np.argmax(np.abs(chunk[:int((20.0/1000.0)*sampling_rate)]))
+            abs_stim_idx = start_idx + local_stim_idx
+            epoch_start = abs_stim_idx - pre_pts
+            epoch_end = abs_stim_idx + post_pts
+            if epoch_start >= 0 and epoch_end <= len(voltage_stream):
+                aligned_epochs.append(np.ravel(voltage_stream[epoch_start:epoch_end]))
+
+    stacked_epochs = np.vstack(aligned_epochs)
+    voltage_raw = np.ravel(np.mean(stacked_epochs, axis=0))
+    time = np.ravel((np.arange(len(voltage_raw)) - pre_pts) / sampling_rate * 1000.0)
+
+    baseline_mask = (time >= -5.0) & (time < -0.5)
+
+    # Convert all stacked epochs to baseline-corrected mV for background plotting
+    stacked_epochs_mv = [(ep - np.mean(ep[baseline_mask])) / 1000.0 for ep in stacked_epochs]
+
+    voltage_corrected = voltage_raw - np.mean(voltage_raw[baseline_mask])
+    voltage_corrected_mv = voltage_corrected / 1000.0
+
+    time_fine = np.linspace(time[0], time[-1], len(time) * 10)
+    cs = CubicSpline(time, voltage_corrected_mv)
+    voltage_fine = cs(time_fine)
+
+    return time, time_fine, voltage_fine, stacked_epochs_mv
+
+# PROCESS BOTH FILES
+time_prox, time_fine_prox, volt_fine_prox, stack_prox_mv = process_abf_file_with_sweeps(path_proximal)
+time_dist, time_fine_dist, volt_fine_dist, stack_dist_mv = process_abf_file_with_sweeps(path_distal)
+
+# DETECT N1 AND N2 PEAKS
+n1_window = (0.12, 0.40)
+
+# Proximal N1 & N2
+mask_n1_prox = (time_fine_prox >= n1_window[0]) & (time_fine_prox <= n1_window[1])
+t_n1_prox = float(time_fine_prox[mask_n1_prox][np.argmin(volt_fine_prox[mask_n1_prox])])
+v_n1_prox = float(volt_fine_prox[mask_n1_prox][np.argmin(volt_fine_prox[mask_n1_prox])])
+
+n2_window_prox = (t_n1_prox + 0.15, t_n1_prox + 0.60)
+mask_n2_prox = (time_fine_prox >= n2_window_prox[0]) & (time_fine_prox <= n2_window_prox[1])
+t_n2_prox = float(time_fine_prox[mask_n2_prox][np.argmin(volt_fine_prox[mask_n2_prox])])
+v_n2_prox = float(volt_fine_prox[mask_n2_prox][np.argmin(volt_fine_prox[mask_n2_prox])])
+
+# Distal N1 & N2
+mask_n1_dist = (time_fine_dist >= n1_window[0]) & (time_fine_dist <= n1_window[1])
+t_n1_dist = float(time_fine_dist[mask_n1_dist][np.argmin(volt_fine_dist[mask_n1_dist])])
+v_n1_dist = float(volt_fine_dist[mask_n1_dist][np.argmin(volt_fine_dist[mask_n1_dist])])
+
+n2_window_dist = (t_n1_dist + 0.15, t_n1_dist + 0.60)
+mask_n2_dist = (time_fine_dist >= n2_window_dist[0]) & (time_fine_dist <= n2_window_dist[1])
+t_n2_dist = float(time_fine_dist[mask_n2_dist][np.argmin(volt_fine_dist[mask_n2_dist])])
+v_n2_dist = float(volt_fine_dist[mask_n2_dist][np.argmin(volt_fine_dist[mask_n2_dist])])
+
+# CONDUCTION VELOCITY CALCULATIONS (DELTA METHOD)
+delta_t_n1 = t_n1_dist - t_n1_prox
+delta_cv_n1 = delta_distance_mm / delta_t_n1 if delta_t_n1 > 0 else 0.0
+
+delta_t_n2 = t_n2_dist - t_n2_prox
+delta_cv_n2 = delta_distance_mm / delta_t_n2 if delta_t_n2 > 0 else 0.0
+
+print(f"\n--- Two-Point Delta Analysis Results ---")
+print(f"Delta Distance (Delta d): {delta_distance_mm} mm")
+print(f"N1 Delta Time: {delta_t_n1:.3f} ms | N1 Delta CV: {delta_cv_n1:.2f} m/s")
+print(f"N2 Delta Time: {delta_t_n2:.3f} ms | N2 Delta CV: {delta_cv_n2:.2f} m/s")
+
+# INTERACTIVE PLOTLY VISUALIZATION
+fig = go.Figure()
+
+# 1. Background Raw Sweeps (Proximal in light red/pink)
+for ep_mv in stack_prox_mv:
+    fig.add_trace(go.Scatter(
+        x=time_prox, y=ep_mv, mode='lines',
+        line=dict(color='lightcoral', width=0.6), opacity=0.12,
+        showlegend=False, hoverinfo='skip'
+    ))
+
+# 2. Background Raw Sweeps (Distal in light blue/cyan)
+for ep_mv in stack_dist_mv:
+    fig.add_trace(go.Scatter(
+        x=time_dist, y=ep_mv, mode='lines',
+        line=dict(color='skyblue', width=0.6), opacity=0.12,
+        showlegend=False, hoverinfo='skip'
+    ))
+
+# 3. Grand Average Lines
+fig.add_trace(go.Scatter(x=time_fine_prox, y=volt_fine_prox, mode='lines', line=dict(color='firebrick', width=2.5), name=f'Proximal ({file_proximal})'))
+fig.add_trace(go.Scatter(x=time_fine_dist, y=volt_fine_dist, mode='lines', line=dict(color='royalblue', width=2.5), name=f'Distal ({file_distal})'))
+
+# 4. Highlight N1 Peaks (Black text for latency labels)
+fig.add_trace(go.Scatter(
+    x=[t_n1_prox, t_n1_dist], y=[v_n1_prox, v_n1_dist],
+    mode='markers+text', marker=dict(size=10, color='darkred'),
+    text=[f'Prox N1 ({t_n1_prox:.3f}ms)', f'Dist N1 ({t_n1_dist:.3f}ms)'],
+    textposition='bottom center',
+    textfont=dict(color='black', size=11, family='sans-serif'),
+    name='N1 Peaks'
+))
+
+# 5. Highlight N2 Peaks (Black text for latency labels)
+fig.add_trace(go.Scatter(
+    x=[t_n2_prox, t_n2_dist], y=[v_n2_prox, v_n2_dist],
+    mode='markers+text', marker=dict(size=10, color='darkblue'),
+    text=[f'Prox N2 ({t_n2_prox:.3f}ms)', f'Dist N2 ({t_n2_dist:.3f}ms)'],
+    textposition='bottom center',
+    textfont=dict(color='black', size=11, family='sans-serif'),
+    name='N2 Peaks'
+))
+
+# Layout configuration
+fig.update_layout(
+    title=f'Two-Point Delta CV Analysis | N1 CV: {delta_cv_n1:.2f} m/s | N2 CV: {delta_cv_n2:.2f} m/s',
+    xaxis_title='Time Post-Stimulus (ms)',
+    yaxis_title='Amplitude (mV)',
+    xaxis=dict(range=[-0.05, 1.0]),
+    yaxis=dict(range=[-0.35, 0.15]),
+    template='plotly_white',
+    hovermode='closest',
+    dragmode='pan',
+    width=950,
+    height=550
+)
+
+fig.show(config={'scrollZoom': True})
