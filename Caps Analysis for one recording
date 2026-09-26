@@ -1,0 +1,313 @@
+!pip install neo
+import os
+import neo
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.signal import welch
+from google.colab import drive
+from scipy.integrate import simpson
+from scipy.interpolate import CubicSpline
+
+
+from google.colab import drive
+
+if not os.path.exists('/content/drive'):
+    drive.mount('/content/drive')
+if not os.path.exists('/content/drive'):
+    drive.mount('/content/drive')
+
+# BASAL NOISE ANALYSIS PIPELINE (00061.abf) Just to see basal levels of noise in the recordings
+
+
+# CONFIGURATION
+noise_file_path = '/content/drive/MyDrive/Caps_Analysis/00061.abf'
+
+if not os.path.exists(noise_file_path):
+    raise FileNotFoundError(f"Could not find file at: {noise_file_path}")
+
+print(f"-> Loading basal noise file: {noise_file_path}")
+reader = neo.io.AxonIO(filename=noise_file_path)
+block = reader.read_block(lazy=False)
+
+# Extract signal stream
+sig = block.segments[0].analogsignals[0]
+noise_stream = np.ravel(sig[:, 0].magnitude)
+sampling_rate = float(sig.sampling_rate.rescale('Hz').magnitude)
+
+# Convert units to mV if recorded in microvolts
+if np.max(np.abs(noise_stream)) > 1000:
+    noise_stream = noise_stream / 1000.0
+
+time_noise = np.arange(len(noise_stream)) / sampling_rate * 1000.0 # in ms
+
+# 1. Calculate Key Noise Metrics
+rms_noise = np.sqrt(np.mean(noise_stream**2))
+std_noise = np.std(noise_stream)
+p2p_noise = np.ptp(noise_stream)
+
+print(f"\n--- Basal Noise Statistics ---")
+print(f"RMS Noise: {rms_noise:.4f} mV")
+print(f"Standard Deviation (σ): {std_noise:.4f} mV")
+print(f"Peak-to-Peak Noise: {p2p_noise:.4f} mV")
+print(f"Suggested Signal Detection Threshold (> 3σ): {3 * std_noise:.4f} mV")
+
+# 2. Power Spectral Density (PSD) to check for line hum (50Hz / 60Hz)
+frequencies, psd = welch(noise_stream, fs=sampling_rate, nperseg=int(sampling_rate))
+
+# 3. Visualization
+fig, axes = plt.subplots(2, 1, figsize=(10, 6))
+
+# Plot raw noise trace (first 500 ms)
+mask_view = time_noise <= 500.0
+axes[0].plot(time_noise[mask_view], noise_stream[mask_view], color='dimgray', lw=0.8)
+axes[0].axhline(3 * std_noise, color='red', linestyle='--', alpha=0.7, label='+3σ Threshold')
+axes[0].axhline(-3 * std_noise, color='red', linestyle='--', alpha=0.7, label='-3σ Threshold')
+axes[0].set_title(f'Basal Noise Trace (RMS: {rms_noise:.4f} mV)', fontsize=12, fontweight='bold')
+axes[0].set_xlabel('Time (ms)')
+axes[0].set_ylabel('Amplitude (mV)')
+axes[0].legend(loc='upper right')
+
+# Plot Frequency Spectrum (PSD) up to 500 Hz
+axes[1].semilogy(frequencies, psd, color='purple', lw=1.2)
+axes[1].set_xlim(0, 500)
+axes[1].set_title('Power Spectral Density (Noise Frequency Components)', fontsize=12, fontweight='bold')
+axes[1].set_xlabel('Frequency (Hz)')
+axes[1].set_ylabel('Power ($\mathrm{mV^2/Hz}$)')
+axes[1].grid(True, which='both', linestyle=':', alpha=0.5)
+
+plt.tight_layout()
+plt.show()
+
+# CAP ANALYSIS PIPELINE (Complete Final Version with Local Baseline)
+# Objective: Automate the extraction, alignment, interpolation,
+# and quantification of Compound Action Potentials (N1 and N2)
+# from raw electrophysiological recordings (.abf files).
+
+# CONFIGURATION
+# Objective: Set up file paths, target experiments, and physical parameters.
+file_name = '00059.abf'  # Switch to '00062.abf' or '00063.abf' as needed
+file_path = f'/content/drive/MyDrive/Caps_Analysis/{file_name}'
+electrode_distance_mm = 11.0  # Distance between stimulating and recording electrodes in mm
+
+if not os.path.exists(file_path):
+    raise FileNotFoundError(f"Could not find file at: {file_path}")
+
+print(f"-> Loading file: {file_name}")
+reader = neo.io.AxonIO(filename=file_path)
+block = reader.read_block(lazy=False)
+
+# 1. NATIVE SEGMENT EXTRACTION AND ALIGNMENT
+# Objective: Isolate individual stimulation sweeps from the continuous recording
+# and temporally align them to the stimulus artifact to ensure phase-locking.
+pre_stim_ms = 5.0
+post_stim_ms = 45.0
+aligned_epochs = []
+sampling_rate = None
+
+for seg in block.segments:
+    if len(seg.analogsignals) > 0:
+        sig = seg.analogsignals[0]
+        sampling_rate = float(sig.sampling_rate.rescale('Hz').magnitude)
+        data = np.ravel(sig[:, 0].magnitude)
+
+        pre_pts = int((pre_stim_ms / 1000.0) * sampling_rate)
+        post_pts = int((post_stim_ms / 1000.0) * sampling_rate)
+
+        search_window_pts = int((20.0 / 1000.0) * sampling_rate)
+        if len(data) >= search_window_pts:
+            local_stim_idx = np.argmax(np.abs(data[:search_window_pts]))
+            epoch_start = local_stim_idx - pre_pts
+            epoch_end = local_stim_idx + post_pts
+
+            if epoch_start >= 0 and epoch_end <= len(data):
+                aligned_epochs.append(data[epoch_start:epoch_end])
+
+if len(aligned_epochs) == 0:
+    sig = block.segments[0].analogsignals[0]
+    voltage_stream = np.ravel(sig[:, 0].magnitude)
+    sampling_rate = float(sig.sampling_rate.rescale('Hz').magnitude)
+    sweep_duration_ms = 1000.0
+    points_per_sweep = int((sweep_duration_ms / 1000.0) * sampling_rate)
+    total_sweeps = len(voltage_stream) // points_per_sweep
+    pre_pts = int((pre_stim_ms / 1000.0) * sampling_rate)
+    post_pts = int((post_stim_ms / 1000.0) * sampling_rate)
+
+    for i in range(total_sweeps):
+        start_idx = i * points_per_sweep
+        end_idx = start_idx + points_per_sweep
+        chunk = voltage_stream[start_idx:end_idx]
+        local_stim_idx = np.argmax(np.abs(chunk[:int((20.0/1000.0)*sampling_rate)]))
+        abs_stim_idx = start_idx + local_stim_idx
+        epoch_start = abs_stim_idx - pre_pts
+        epoch_end = abs_stim_idx + post_pts
+        if epoch_start >= 0 and epoch_end <= len(voltage_stream):
+            aligned_epochs.append(np.ravel(voltage_stream[epoch_start:epoch_end]))
+
+stacked_epochs = np.vstack(aligned_epochs)
+voltage_raw = np.ravel(np.mean(stacked_epochs, axis=0))
+time = np.ravel((np.arange(len(voltage_raw)) - pre_pts) / sampling_rate * 1000.0)
+
+print(f"-> Successfully processed {len(aligned_epochs)} sweeps for {file_name}!")
+
+# 2. BASELINE CORRECTION & UNIT CONVERSION (uV to mV)
+# Objective: Level the pre-stimulus baseline to 0 mV (using the -5 to -0.5 ms window)
+# and convert raw microvolts into standard millivolts.
+baseline_mask = (time >= -5.0) & (time < -0.5)
+voltage_corrected = voltage_raw - np.mean(voltage_raw[baseline_mask])
+voltage_corrected_mv = voltage_corrected / 1000.0
+
+# 3. CUBIC SPLINE INTERPOLATION & PEAK DETECTION
+# Objective: Overcome the rigid digital timing grid of the hardware (20 kHz)
+# by fitting a smooth cubic spline curve to resolve sub-millisecond latencies.
+time_fine = np.linspace(time[0], time[-1], len(time) * 10)
+cs = CubicSpline(time, voltage_corrected_mv)
+voltage_fine = cs(time_fine)
+
+# N1 Peak Detection (Fine Grid): Fast-conducting myelinated fibers (Aα/β)
+n1_window = (0.12, 0.35)
+n1_mask = (time_fine >= n1_window[0]) & (time_fine <= n1_window[1])
+t_fine_n1 = time_fine[n1_mask]
+v_fine_n1 = voltage_fine[n1_mask]
+
+n1_best_idx = np.argmin(v_fine_n1)
+t_n1 = float(t_fine_n1[n1_best_idx])
+v_n1 = float(v_fine_n1[n1_best_idx])
+
+# N2 Peak Detection (Fine Grid): Slower-conducting fibers (Aδ)
+n2_window = (t_n1 + 0.15, t_n1 + 0.60)
+n2_mask = (time_fine >= n2_window[0]) & (time_fine <= n2_window[1])
+if np.any(n2_mask):
+    t_fine_n2 = time_fine[n2_mask]
+    v_fine_n2 = voltage_fine[n2_mask]
+    n2_best_idx = np.argmin(v_fine_n2)
+    t_n2 = float(t_fine_n2[n2_best_idx])
+    v_n2 = float(v_fine_n2[n2_best_idx])
+else:
+    t_n2, v_n2 = t_n1 + 0.30, 0.0
+
+# Calculate Conduction Velocity (CV = distance / latency)
+cv_n1 = electrode_distance_mm / t_n1 if t_n1 > 0 else 0.0
+cv_n2 = electrode_distance_mm / t_n2 if t_n2 > 0 else 0.0
+
+print(f"\n--- Interpolated Results for {file_name} ---")
+print(f"N1 Latency: {t_n1:.3f} ms | Amplitude: {v_n1:.3f} mV | CV: {cv_n1:.2f} m/s")
+print(f"N2 Latency: {t_n2:.3f} ms | Amplitude: {v_n2:.3f} mV | CV: {cv_n2:.2f} m/s")
+
+# 4. DYNAMIC BOUNDS, LOCAL BASELINE CHORD & SIMPSON'S INTEGRATIONipación y si prefieren que el grupo no pase por su laboratorio, por favor avísennos con anticipación. De esta manera, podremos ajustar el recorrido y evitar ese espacio sin inconvenientes.
+
+Muchas gracias por su disposición y colaboración para hacer posible esta visita y seguir
+# Objective: Programmatically define physiological start/end shoulders for each peak,
+# construct a local baseline chord, and compute precise Area Under the Curve (AUC) using Simpson's rule (integrating)
+
+# N1 Dynamic Bounds & Chord Baseline (Artifact-safe clamping)
+safe_n1_start = 0.125
+left_bound_n1 = max(safe_n1_start, t_n1 - 0.07)
+
+search_n1_right = (time_fine >= t_n1) & (time_fine <= t_n1 + 0.25)
+right_bound_n1 = time_fine[search_n1_right][np.argmax(voltage_fine[search_n1_right])] if np.any(search_n1_right) else t_n1 + 0.05
+
+mask_fine_n1 = (time_fine >= left_bound_n1) & (time_fine <= right_bound_n1)
+x_fine_n1 = time_fine[mask_fine_n1]
+y_fine_n1 = voltage_fine[mask_fine_n1]
+
+v_left_n1 = voltage_fine[np.argmin(np.abs(time_fine - left_bound_n1))]
+v_right_n1 = voltage_fine[np.argmin(np.abs(time_fine - right_bound_n1))]
+baseline_n1 = np.linspace(v_left_n1, v_right_n1, len(x_fine_n1))
+auc_n1 = float(simpson(baseline_n1 - y_fine_n1, x=x_fine_n1))
+
+# N2 Adaptive Shoulder-to-shoulder Bounds & Chord Baseline
+search_n2_left = (time_fine >= t_n1 + 0.05) & (time_fine <= t_n2)
+if np.any(search_n2_left):
+    left_bound_n2 = time_fine[search_n2_left][np.argmax(voltage_fine[search_n2_left])]
+else:
+    left_bound_n2 = t_n1 + 0.15
+
+search_n2_right = (time_fine >= t_n2) & (time_fine <= t_n2 + 0.25)
+if np.any(search_n2_right):
+    right_bound_n2 = time_fine[search_n2_right][np.argmax(voltage_fine[search_n2_right])]
+else:
+    right_bound_n2 = t_n2 + 0.15
+
+mask_fine_n2 = (time_fine >= left_bound_n2) & (time_fine <= right_bound_n2)
+x_fine_n2 = time_fine[mask_fine_n2]
+y_fine_n2 = voltage_fine[mask_fine_n2]
+
+v_left_n2 = voltage_fine[np.argmin(np.abs(time_fine - left_bound_n2))]
+v_right_n2 = voltage_fine[np.argmin(np.abs(time_fine - right_bound_n2))]
+baseline_n2 = np.linspace(v_left_n2, v_right_n2, len(x_fine_n2))
+auc_n2 = float(simpson(baseline_n2 - y_fine_n2, x=x_fine_n2))
+
+print(f"N1 AUC: {auc_n1:.4f} mV·ms")
+print(f"N2 AUC: {auc_n2:.4f} mV·ms")
+
+import plotly.graph_objects as go
+
+# Initialize Plotly figure
+fig = go.Figure()
+
+# 1. Add background raw sweeps (low opacity gray lines)
+for ep in stacked_epochs:
+    ep_corr_mv = (ep - np.mean(ep[baseline_mask])) / 1000.0
+    fig.add_trace(go.Scatter(
+        x=time, y=ep_corr_mv,
+        mode='lines',
+        line=dict(color='gray', width=0.8),
+        opacity=0.15,
+        showlegend=False,
+        hoverinfo='skip'
+    ))
+
+# 2. Add N1 shaded area under the curve
+fig.add_trace(go.Scatter(
+    x=np.concatenate([x_fine_n1, x_fine_n1[::-1]]),
+    y=np.concatenate([y_fine_n1, baseline_n1[::-1]]),
+    fill='toself',
+    fillcolor='rgba(255, 0, 0, 0.25)',
+    line=dict(color='rgba(255,255,255,0)'),
+    name=f'N1 AUC: {auc_n1:.3f} mV·ms'
+))
+
+# 3. Add N2 shaded area under the curve
+fig.add_trace(go.Scatter(
+    x=np.concatenate([x_fine_n2, x_fine_n2[::-1]]),
+    y=np.concatenate([y_fine_n2, baseline_n2[::-1]]),
+    fill='toself',
+    fillcolor='rgba(0, 0, 255, 0.25)',
+    line=dict(color='rgba(255,255,255,0)'),
+    name=f'N2 AUC: {auc_n2:.3f} mV·ms'
+))
+
+# 4. Add Smooth Grand Average Line
+fig.add_trace(go.Scatter(
+    x=time_fine, y=voltage_fine,
+    mode='lines',
+    line=dict(color='black', width=2),
+    name=f'Grand Average (n={len(aligned_epochs)})'
+))
+
+# 5. Add Peak Markers (N1 & N2)
+fig.add_trace(go.Scatter(
+    x=[t_n1, t_n2], y=[v_n1, v_n2],
+    mode='markers+text',
+    marker=dict(size=10, color=['red', 'blue']),
+    text=[f'N1 ({t_n1:.3f} ms)', f'N2 ({t_n2:.3f} ms)'],
+    textposition='bottom center',
+    name='Peaks'
+))
+
+# Layout configuration with pan enabled by default
+fig.update_layout(
+    title=f'Interactive CAP Analysis - {file_name}',
+    xaxis_title='Time Post-Stimulus (ms)',
+    yaxis_title='Amplitude (mV)',
+    xaxis=dict(range=[-0.05, 1.0]),
+    yaxis=dict(range=[-0.35, 0.15]),
+    template='plotly_white',
+    hovermode='closest',
+    dragmode='pan',  # <--- This makes click-and-drag move the graph instead of zooming
+    width=900,
+    height=500
+)
+
+# Keep scroll zoom enabled
+fig.show(config={'scrollZoom': True})
